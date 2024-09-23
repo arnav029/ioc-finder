@@ -8,6 +8,11 @@ import click
 import ioc_fanger
 from d8s_strings import string_remove_from_end
 from pyparsing import ParseResults
+from types import SimpleNamespace
+import base64
+import re
+from asyncio.log import logger
+from urllib.parse import urlparse
 
 from ioc_finder import ioc_grammars
 
@@ -46,7 +51,80 @@ DEFAULT_IOC_TYPES = [
     "urls",
     "user_agents",
     "xmpp_addresses",
+    "directory",
+    "file",
+    "x509_certificate",
+    "artifact",
+    "network_traffic",
 ]
+COMMON_FILE_EXTENSIONS = [
+    "txt",
+    "pdf",
+    "doc",
+    "docx",
+    "xls",
+    "xlsx",
+    "ppt",
+    "pptx",
+    "csv",  # Documents
+    "jpg",
+    "jpeg",
+    "png",
+    "gif",
+    "bmp",
+    "tif",
+    "tiff",
+    "svg",  # Images
+    "mp3",
+    "wav",
+    "mp4",
+    "avi",
+    "mov",
+    "wmv",  # Audio/Video
+    "zip",
+    "rar",
+    "tar",
+    "gz",
+    "7z",  # Archives
+    "html",
+    "css",
+    "js",
+    "xml",
+    "json",
+    "sql",  # Web files
+]
+
+IOC_KEYS = SimpleNamespace(
+    IPS="ips",
+    SHA1="sha1",
+    EMAILS="emails",
+    SHA512="sha512",
+    IPV6="ipv6",
+    SHA256="sha256",
+    SHA384="sha384",
+    MD5="md5",
+    URLS="urls",
+    DOMAINS="domains",
+    SHA224="sha224",
+    SSDEEPS="ssdeeps",
+    CVE_IDS="cve_ids",
+    REGISTRY_KEY_PATH="registry_key_path",
+    FILE_PATHS="file_paths",
+    ASN="asn",
+    MUTEX="mutex",
+    AS="as",
+    CIDRS="cidrs",
+    ARTIFACT="artifact",
+    DIRECTORY="directory",
+    EMAIL_MESSAGE="email_message",
+    MAC_ADDRESS="mac_address",
+    NETWORK_TRAFFIC="network_traffic",
+    PROCESS="process",
+    SOFTWARE="software",
+    USER_ACCOUNT="user_account",
+    X509_CERTIFICATE="x509_certificate",
+    FILE="file",
+)
 
 
 def _deduplicate(indicator_list: Iterable) -> List:
@@ -155,6 +233,88 @@ def parse_ipv4_addresses(text):
     """."""
     addresses = ioc_grammars.ipv4_address.searchString(text)
     return _listify(addresses)
+
+def parse_directory_paths(text):
+    text = text + "\n"
+    directory_pattern = re.compile(r"(?<!\S)([A-Z]:\\[^,/\s]*|/[^\s,]+)(?=\s|,)")
+    file_extension_pattern = re.compile(r"\.[^\s/]+")
+    invalid_chars_pattern = re.compile(r'[()<>"|%?*[\]{}\']')
+
+    directories = directory_pattern.findall(text)
+
+    filtered_directories = [
+        directory
+        for directory in directories
+        if not (
+            file_extension_pattern.search(directory) or invalid_chars_pattern.search(directory)
+        )
+    ]
+    return list(set(filtered_directories))
+
+def is_base64(data):
+    try:
+        if data.strip() == "":
+            return False
+        base64.b64decode(data, validate=True)
+        return True
+    except Exception:
+        return False
+    
+def parse_artifacts(text):
+    try:
+        lines = re.split(r"\n|,\s*", text)
+        lines = list(set(lines))
+        parsed_artifacts = []
+
+        for line in lines:
+            # Check if the line is base64-encoded data as payload_bin is a base64-encoded value.
+            # We are skipping url's due to limitations from our end can pick in later enhancements.
+            if is_base64(line):
+                artifact_data = {"payload_bin": line}
+            else:
+                logger.info(f"Invalid artifact: {line}")
+                continue
+            parsed_artifacts.append(artifact_data)
+        return parsed_artifacts
+    except Exception as e:
+        logger.error(f"Error parsing artifacts: {e}")
+        return None
+    
+def extract_x509_certificates(text):
+    # Regular expression to match X.509 certificate blocks
+    cert_pattern = re.compile(
+        r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", re.DOTALL
+    )
+
+    x509_certificates = []
+    cert_matches = cert_pattern.findall(text)
+
+    for cert_match in cert_matches:
+        try:
+            cert = x509.load_pem_x509_certificate(cert_match.encode(), default_backend())
+            x509_certificates.append(
+                {
+                    "serial_number": cert.serial_number,
+                    "issuer": str(cert.issuer),
+                    "validity_not_before": str(cert.not_valid_before),
+                    "validity_not_after": str(cert.not_valid_after),
+                    "description": cert_match,
+                }
+            )
+        except Exception as e:
+            logger.info(f"Invalid certificate: {str(e)}")
+
+    return x509_certificates
+
+def parse_files(text: str) -> list:
+    """
+    This function parses out files from the input text.
+    """
+    # Regular expression pattern to match file paths with common extensions
+    pattern = r"\b\w+\.(?:" + "|".join(COMMON_FILE_EXTENSIONS) + r")\b"
+    matches = re.findall(pattern, text, re.IGNORECASE)
+
+    return matches
 
 
 def parse_ipv6_addresses(text):
@@ -548,6 +708,34 @@ def find_iocs(  # noqa: CCR001 pylint: disable=R0912,R0915
         iocs["ipv4s"] = parse_ipv4_addresses(text)
     if "ipv6s" in included_ioc_types:
         iocs["ipv6s"] = parse_ipv6_addresses(text)
+
+    #observables
+    if "directory" in included_ioc_types:
+        dir_paths = parse_directory_paths(text)
+        iocs[IOC_KEYS.DIRECTORY] = [{"path": dir_path} for dir_path in dir_paths]
+
+    if "artifact" in included_ioc_types:
+        iocs[IOC_KEYS.ARTIFACT] = parse_artifacts(text)
+        
+    if "network_traffic" in included_ioc_types:
+        # ipv4-addr ipv6-addr mac-addr domain-name
+        network_ipv4 = parse_ipv4_addresses(text)
+        network_ipv4 = [{"value": ip} for ip in network_ipv4]
+        network_ipv6 = parse_ipv6_addresses(text)
+        network_ipv6 = [{"value": ip} for ip in network_ipv6]
+        network_mac_addr = parse_mac_addresses(text)
+        network_mac_addr = [{"value": addr} for addr in network_mac_addr]
+        network_domains = parse_domain_names(text)
+        network_domains = [{"value": domain} for domain in network_domains]
+
+        iocs[IOC_KEYS.NETWORK_TRAFFIC] = []
+
+    if "file" in included_ioc_types:
+        files = parse_files(text)
+        iocs[IOC_KEYS.FILE] = [{"name": file} for file in files]
+
+    if "x509_certificate" in included_ioc_types:
+        iocs[IOC_KEYS.X509_CERTIFICATE] = extract_x509_certificates(text)
 
     # file hashes
     if "sha512s" in included_ioc_types:
