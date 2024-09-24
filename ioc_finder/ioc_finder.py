@@ -49,6 +49,7 @@ DEFAULT_IOC_TYPES = [
 ]
 
 
+
 def _deduplicate(indicator_list: Iterable) -> List:
     """Deduplicate the list of observables."""
     return list(set(indicator_list))
